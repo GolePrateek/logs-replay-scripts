@@ -76,6 +76,7 @@ class AuthenticatedUser(HttpUser):
         """Replay requests based on log entries after login."""
         if self.csrf_token == None:
             print("Skipping replay, missing authentication session!")
+            print(self.session_cookie)
             return
 
         for entry in log_entries:
