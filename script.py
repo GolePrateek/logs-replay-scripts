@@ -1,108 +1,83 @@
-import time
+import time, os 
 import re
 from locust import HttpUser, task, between
+import json
 
-# Load and parse log file
-# log_file_path = "/mnt/data/031920489000_elasticloadbalancing_us-east-1_app.ICPC-ALB.aab6371aff4cced4_20241116T0115Z_34.237.178.197_2mo6sbj7.log"
-log_file_path = "031920489000_elasticloadbalancing_us-east-1_app.ICPC-ALB.aab6371aff4cced4_20241116T0000Z_34.237.178.197_5831r81y.log"
+json_log_file = "parsed_logs.json"
 
-def parse_log_file(log_file_path):
-    log_data = []
-    timestamp_pattern = r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)"
-    # Updated regex to capture the full URL including potential ports in the path
-    request_pattern = r'"(GET|POST|PUT|DELETE) (https?://[^\s]+) (HTTP/[\d\.]+)"'
+def load_parsed_logs(json_file_path):
+    """Load pre-parsed logs from a JSON file."""
+    try:
+        with open(json_file_path, "r") as file:
+            log_data = json.load(file)  # Load JSON data
+            return log_data
+    except Exception as e:
+        print(f"Error loading logs: {e}")
+        return []
 
-    with open(log_file_path, "r") as file:
-        for line in file:
-            timestamp_match = re.search(timestamp_pattern, line)
-            request_match = re.search(request_pattern, line)
-            
-            if timestamp_match and request_match:
-                timestamp = timestamp_match.group(1)
-                method = request_match.group(1)
-                url = request_match.group(2)
-                print(url)  # This will print the extracted URL for verification
+# Load logs from JSON
+log_entries = load_parsed_logs(json_log_file)
 
-                log_data.append({"timestamp": timestamp, "method": method, "url": url})
-
-    return log_data
-
-
-log_entries = parse_log_file(log_file_path)
-
-# Convert timestamps to replay in real-time
-base_time = None
-for entry in log_entries:
-    entry["timestamp"] = time.strptime(entry["timestamp"], "%Y-%m-%dT%H:%M:%S.%fZ")
-    if base_time is None:
-        base_time = entry["timestamp"]
-    entry["delay"] = time.mktime(entry["timestamp"]) - time.mktime(base_time)  # Delay from first request
-print(log_entries)
-
-# Locust User Behavior
+# Locust User Class
 class AuthenticatedUser(HttpUser):
-    wait_time = between(1, 3)
+    wait_time = between(1, 3)  # Simulating real user wait time
+    csrf_token = None  # Store CSRF token globally for reuse
+    session_cookie = None  # Store session cookie
 
     def on_start(self):
-        """Login before running any tests"""
+        """Login once before running any tests."""
         self.login()
 
     def login(self):
-        """Perform login and save cookies/session"""
-        # First, send a GET request to fetch the login page and extract the CSRF token
+        """Perform login and store CSRF token & session cookie."""
+        print("Logging in...")
+
+        # Step 1: GET login page to fetch CSRF token
         response = self.client.get("/login")
-        
-        # Print out the response text to help with debugging
-        # print("Login page response:")
-        # print(response.text[:1000])  # Only print first 1000 characters for readability
-
-        # Extract the CSRF token from the page
         csrf_token = self.extract_csrf_token(response.text)
-        
-        if csrf_token:
-            print("CSRF token extracted successfully!")
-        else:
-            print("Failed to extract CSRF token.")
-            return  # If no CSRF token found, stop the login process
 
-        # Prepare login data with CSRF token, username, and password
+        if not csrf_token:
+            print("Failed to extract CSRF token!")
+            return
+
+        print(f"CSRF Token: {csrf_token}")
+
+        # Step 2: Perform login with extracted CSRF token
         login_data = {
-            '_csrf_token': csrf_token,  # CSRF token
-            '_username': 'admin',  # Replace with actual username
-            '_password': '2DcI3qf6orXMm422'  # Replace with actual password
+            '_csrf_token': csrf_token,
+            '_username': 'anup',  # Replace with actual username
+            '_password': 'Password@123'  # Replace with actual password
         }
 
-        # Send the login request with the CSRF token and credentials
         headers = {
-            "Content-Type": "application/x-www-form-urlencoded",  # Make sure this is correct
+            "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": "Locust/1.0"
         }
 
-        response = self.client.post("/login", data=login_data, headers=headers)
+        login_response = self.client.post("/login", data=login_data, headers=headers)
 
-        # Log the response for debugging
-        print(f"Login response code: {response.status_code}")
+        if login_response.status_code == 200:
+            print("Login successful!")
+            
+            # Save CSRF token & session cookie for future requests
+            self.csrf_token = csrf_token
+            self.session_cookie = login_response.cookies  # Save session cookies
 
-        # Check if login was successful, based on response
-        if response.status_code == 200 and "Welcome" in response.text:  # Adjust success condition based on your app    
-            print("Logged in successfully!")
         else:
-            print("Login failed!")
-            print(f"Error details: {response.text}")
+            print(f"Login failed! Status code: {login_response.status_code}")
 
     def extract_csrf_token(self, html):
-        """Extract the CSRF token from the login page HTML"""
+        """Extract CSRF token from login page HTML."""
         csrf_token_match = re.search(r'name="_csrf_token" value="([^"]+)"', html)
-        
-        if csrf_token_match:
-            return csrf_token_match.group(1)
-        else:
-            return None
-
+        return csrf_token_match.group(1) if csrf_token_match else None
 
     @task
     def replay_logs(self):
-        """Replay requests based on log entries after login"""
+        """Replay requests based on log entries after login."""
+        if self.csrf_token == None:
+            print("Skipping replay, missing authentication session!")
+            return
+
         for entry in log_entries:
             method = entry["method"]
             url = entry["url"]
@@ -110,12 +85,31 @@ class AuthenticatedUser(HttpUser):
 
             time.sleep(delay)  # Simulate original request timing
 
-            # Check for the method type and make the corresponding request
+            # Ensure URL is formatted correctly
+            url = url.lstrip(":443")
+
+            headers = {
+                "X-CSRF-TOKEN": self.csrf_token,
+                "Cookie": f"session={self.session_cookie}",
+                "User-Agent": "Locust/1.0"
+            }
+
+            print(f"Requesting {method} {url}")
+
+            # Send the appropriate request type
             if method == "GET":
-                self.client.get(url)
+                response = self.client.get(url, headers=headers)
             elif method == "POST":
-                self.client.post(url)
+                response = self.client.post(url, headers=headers)
             elif method == "PUT":
-                self.client.put(url)
+                response = self.client.put(url, headers=headers)
             elif method == "DELETE":
-                self.client.delete(url)
+                response = self.client.delete(url, headers=headers)
+
+            if response.status_code == 403:
+                print(f"403 Forbidden: {url}")
+            elif response.status_code == 200:
+                print(f"Success: {url}")
+            else:
+                print(f"Unexpected {response.status_code} for {url}")
+
