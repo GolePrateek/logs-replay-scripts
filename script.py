@@ -1,116 +1,91 @@
-import time, os 
+import os
 import re
-from locust import HttpUser, task, between
 import json
+import logging
+from datetime import datetime, timedelta
+from collections import defaultdict
+from urllib.parse import urlparse
 
-json_log_file = "parsed_logs.json"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def load_parsed_logs(json_file_path):
-    """Load pre-parsed logs from a JSON file."""
-    try:
-        with open(json_file_path, "r") as file:
-            log_data = json.load(file)  # Load JSON data
-            return log_data
-    except Exception as e:
-        print(f"Error loading logs: {e}")
-        return []
+# Time slots in IST with 5-minute intervals
+time_intervals = {f"{hour:02d}:{minute:02d} - {hour:02d}:{minute+5:02d}": []
+                  for hour in range(24) for minute in range(0, 60, 5)}
 
-# Load logs from JSON
-log_entries = load_parsed_logs(json_log_file)
+def parse_elb_log(line):
+    log_pattern = re.compile(
+        r'(?P<protocol>\S+) (?P<timestamp>\S+) (?P<elb>\S+) '
+        r'(?P<client_ip>\d+\.\d+\.\d+\.\d+):(?P<client_port>\d+) '
+        r'(?P<target_ip>\d+\.\d+\.\d+\.\d+):(?P<target_port>\d+) '
+        r'(?P<request_time>[\d\.]+) (?P<target_time>[\d\.]+) (?P<response_time>[\d\.]+) '
+        r'(?P<http_status>\d+) (?P<elb_status>\d+) (?P<sent_bytes>\d+) (?P<received_bytes>\d+) '
+        r'"(?P<request>[^"]+)"'
+    )
+    
+    match = log_pattern.match(line)
+    if match:
+        data = match.groupdict()
+        request_parts = data["request"].split(" ")
+        data["method"] = request_parts[0] if len(request_parts) > 1 else ""
+        parsed_url = urlparse(request_parts[1]) if len(request_parts) > 1 else ""
+        data["url"] = parsed_url.path.rstrip("/")  # Normalize
+        data["http_version"] = request_parts[2] if len(request_parts) > 2 else ""
+        data["response_time"] = float(data["response_time"])
+        data["http_status"] = int(data["http_status"])
+        return data
+    return None
 
-# Locust User Class
-class AuthenticatedUser(HttpUser):
-    wait_time = between(1, 3)  # Simulating real user wait time
-    csrf_token = None  # Store CSRF token globally for reuse
-    session_cookie = None  # Store session cookie
+def convert_utc_to_ist(utc_time):
+    return utc_time + timedelta(hours=5, minutes=30)
 
-    def on_start(self):
-        """Login once before running any tests."""
-        self.login()
+def get_time_interval(ist_time):
+    hour, minute = ist_time.hour, ist_time.minute
+    start_minute = (minute // 5) * 5
+    end_minute = start_minute + 5
+    return f"{hour:02d}:{start_minute:02d} - {hour:02d}:{end_minute:02d}"
 
-    def login(self):
-        """Perform login and store CSRF token & session cookie."""
-        print("Logging in...")
-
-        # Step 1: GET login page to fetch CSRF token
-        response = self.client.get("/login")
-        csrf_token = self.extract_csrf_token(response.text)
-
-        if not csrf_token:
-            print("Failed to extract CSRF token!")
-            return
-
-        print(f"CSRF Token: {csrf_token}")
-
-        # Step 2: Perform login with extracted CSRF token
-        login_data = {
-            '_csrf_token': csrf_token,
-            '_username': 'anup',  # Replace with actual username
-            '_password': 'Password@123'  # Replace with actual password
+def process_logs(log_dir):
+    if not os.path.exists(log_dir):
+        logging.error(f"Log directory '{log_dir}' does not exist.")
+        return None
+    
+    log_files = [f for f in os.listdir(log_dir) if f.endswith(".log")]
+    interval_data = defaultdict(lambda: {"target_avg_time": [], "response_avg_time": [], "url_list": defaultdict(lambda: {"count": 0, "status_codes": defaultdict(int)})})
+    
+    for file in log_files:
+        try:
+            with open(os.path.join(log_dir, file), "r") as f:
+                for line in f:
+                    log_data = parse_elb_log(line.strip())
+                    if log_data:
+                        utc_time = datetime.strptime(log_data["timestamp"], "%Y-%m-%dT%H:%M:%S.%fZ")
+                        ist_time = convert_utc_to_ist(utc_time)
+                        time_slot = get_time_interval(ist_time)
+                        interval_data[time_slot]["target_avg_time"].append(float(log_data["target_time"]))
+                        interval_data[time_slot]["response_avg_time"].append(float(log_data["response_time"]))
+                        url_entry = interval_data[time_slot]["url_list"][log_data["url"]]
+                        url_entry["count"] += 1
+                        url_entry["status_codes"][log_data["http_status"]] += 1
+        except Exception as e:
+            logging.error(f"Error reading file {file}: {e}")
+    
+    final_output = {}
+    for slot, data in interval_data.items():
+        final_output[slot] = {
+            "target_avg_time": sum(data["target_avg_time"]) / len(data["target_avg_time"]) if data["target_avg_time"] else 0,
+            "response_avg_time": sum(data["response_avg_time"]) / len(data["response_avg_time"]) if data["response_avg_time"] else 0,
+            "url_list": {url: {"count": entry["count"], "status_codes": dict(entry["status_codes"])} for url, entry in data["url_list"].items()}
         }
+    
+    with open("processed_logs_IST.json", "w") as json_file:
+        json.dump(final_output, json_file, indent=4)
+    
+    return "processed_logs_IST.json"
 
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Locust/1.0"
-        }
-
-        login_response = self.client.post("/login", data=login_data, headers=headers)
-
-        if login_response.status_code == 200:
-            print("Login successful!")
-            
-            # Save CSRF token & session cookie for future requests
-            self.csrf_token = csrf_token
-            self.session_cookie = login_response.cookies  # Save session cookies
-
-        else:
-            print(f"Login failed! Status code: {login_response.status_code}")
-
-    def extract_csrf_token(self, html):
-        """Extract CSRF token from login page HTML."""
-        csrf_token_match = re.search(r'name="_csrf_token" value="([^"]+)"', html)
-        return csrf_token_match.group(1) if csrf_token_match else None
-
-    @task
-    def replay_logs(self):
-        """Replay requests based on log entries after login."""
-        if self.csrf_token == None:
-            print("Skipping replay, missing authentication session!")
-            print(self.session_cookie)
-            return
-
-        for entry in log_entries:
-            method = entry["method"]
-            url = entry["url"]
-            delay = entry["delay"]
-
-            time.sleep(delay)  # Simulate original request timing
-
-            # Ensure URL is formatted correctly
-            url = url.lstrip(":443")
-
-            headers = {
-                "X-CSRF-TOKEN": self.csrf_token,
-                "Cookie": f"session={self.session_cookie}",
-                "User-Agent": "Locust/1.0"
-            }
-
-            print(f"Requesting {method} {url}")
-
-            # Send the appropriate request type
-            if method == "GET":
-                response = self.client.get(url, headers=headers)
-            elif method == "POST":
-                response = self.client.post(url, headers=headers)
-            elif method == "PUT":
-                response = self.client.put(url, headers=headers)
-            elif method == "DELETE":
-                response = self.client.delete(url, headers=headers)
-
-            if response.status_code == 403:
-                print(f"403 Forbidden: {url}")
-            elif response.status_code == 200:
-                print(f"Success: {url}")
-            else:
-                print(f"Unexpected {response.status_code} for {url}")
-
+if __name__ == "__main__":
+    log_directory = "elb-logs"
+    output_file = process_logs(log_directory)
+    if output_file:
+        logging.info(f"Logs saved to {output_file}")
+    else:    
+        logging.error("Error processing logs")
